@@ -4,10 +4,74 @@ import json, os, sys, argparse, uuid, re
 from typing import Optional, Tuple, List, Dict
 import datetime
 from dataclasses import dataclass
+from pathlib import Path
 
-TICKLER_DIR = os.path.expanduser("~/Documents/Odin/tickler")
-TICKLER_FILE = os.path.join(TICKLER_DIR, "tickler.jsonl")
+VERSION = "0.1.0"
 
+# ---------------------------------------------------------------------
+# Storage location resolution (CLI --file > env TICKLER_FILE > config)
+# Config file: ~/.config/tickler/config.txt with key `data_file_path=...`
+# If neither CLI nor env override is set, config is REQUIRED.
+# ---------------------------------------------------------------------
+CONFIG_PATH = Path.home() / ".config" / "tickler" / "config.txt"
+
+def _parse_kv_file(path: Path) -> dict:
+    cfg = {}
+    raw = path.read_text(encoding="utf-8")
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        k, v = line.split("=", 1)
+        cfg[k.strip()] = v.strip()
+    return cfg
+
+def _load_config_data_path() -> Path:
+    if not CONFIG_PATH.exists():
+        sys.exit(
+            f"Config file not found: {CONFIG_PATH}\n"
+            f"Create it with a line like:\n"
+            f"  data_file_path=~/Documents/tickler/tickler.jsonl"
+        )
+    try:
+        cfg = _parse_kv_file(CONFIG_PATH)
+    except Exception as e:
+        sys.exit(f"Failed to read config file {CONFIG_PATH}: {e}")
+    val = cfg.get("data_file_path")
+    if not val:
+        sys.exit(f"Missing 'data_file_path' in {CONFIG_PATH}")
+    p = Path(os.path.expandvars(os.path.expanduser(val))).resolve()
+    parent = p.parent
+    if not parent.exists():
+        try:
+            parent.mkdir(parents=True, exist_ok=True)
+        except Exception as e:
+            sys.exit(f"Cannot create parent directory for data file {p}: {e}")
+    return p
+
+def resolve_store_path(cli_file: Optional[str]) -> str:
+    """
+    Choose the JSONL path with precedence:
+      1) CLI --file
+      2) TICKLER_FILE env var
+      3) Config file (required if 1/2 not set)
+    """
+    if cli_file:
+        return os.path.expandvars(os.path.expanduser(cli_file))
+    env = os.environ.get("TICKLER_FILE")
+    if env:
+        return os.path.expandvars(os.path.expanduser(env))
+    return str(_load_config_data_path())
+
+# Will be set in main() after parsing CLI/env/config
+TICKLER_FILE: Optional[str] = None
+
+def _require_path() -> str:
+    if not TICKLER_FILE:
+        sys.exit("Internal error: data file path not resolved.")
+    return TICKLER_FILE
+
+# ---------------------------------------------------------------------
 
 @dataclass
 class TicklerEvent:
@@ -17,7 +81,6 @@ class TicklerEvent:
     when: Optional[str]
     created_at: Optional[str]
     due_at: Optional[str]
-
 
 DATE_PATTERNS = [
     "%Y-%m-%d",
@@ -36,9 +99,10 @@ DATE_PATTERNS = [
 ]
 
 def ensure_storage():
-    os.makedirs(TICKLER_DIR, exist_ok=True)
-    if not os.path.exists(TICKLER_FILE):
-        with open(TICKLER_FILE, "w", encoding="utf-8"):
+    path = _require_path()
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    if not os.path.exists(path):
+        with open(path, "w", encoding="utf-8"):
             pass
 
 def gen_id() -> str:
@@ -134,7 +198,7 @@ def parse_date_string(s: str, now: Optional[datetime.datetime] = None) -> dateti
 def load_events():
     ensure_storage()
     events = []
-    with open(TICKLER_FILE, "r", encoding="utf-8") as f:
+    with open(_require_path(), "r", encoding="utf-8") as f:
         for line in f:
             line = line.strip()
             if not line:
@@ -147,7 +211,7 @@ def load_events():
 
 def append_event(ev: dict):
     ensure_storage()
-    with open(TICKLER_FILE, "a", encoding="utf-8") as f:
+    with open(_require_path(), "a", encoding="utf-8") as f:
         f.write(json.dumps(ev, ensure_ascii=False) + "\n")
 
 def snapshot_state() -> Dict[str, dict]:
@@ -331,8 +395,8 @@ def snooze_item_to(rid: str, new_dt: datetime.datetime, now: Optional[datetime.d
         sys.exit(1)
 
 def print_path():
-    ensure_storage()
-    print(TICKLER_FILE)
+    # Do not force-create the file here; just print the resolved path.
+    print(_require_path())
 
 # ---------- FIND helpers ----------
 
@@ -357,7 +421,6 @@ def collect_records(include_historical: bool) -> List[dict]:
             dt = datetime.datetime.fromisoformat(rec["next_due_at"])
             kind = "recurring"
         else:
-            # Edge: record existed but has neither? Skip unless historical.
             if include_historical:
                 dt = now
                 kind = "one"
@@ -397,19 +460,14 @@ def best_match(query: str, records: List[dict]) -> Optional[dict]:
         )
         return choices[label] if label is not None else None
     except Exception:
-        # Fallback: naive contains/id-prefix match, else longest common substring-ish
         query_l = query.lower().strip()
-        # 1) ID prefix exact
         for rec in records:
             if rec["id"].startswith(query_l):
                 return rec
-        # 2) Text contains
         contains = [rec for rec in records if query_l in rec["text"].lower()]
         if contains:
-            # prefer nearer due date
             contains.sort(key=lambda r: r["when_dt"])
             return contains[0]
-        # 3) Levenshtein-light: smallest abs length diff as a crude proxy
         return min(records, key=lambda r: abs(len(r["text"]) - len(query_l)))
 
 def interactive_find(include_historical: bool):
@@ -429,14 +487,13 @@ def interactive_find(include_historical: bool):
         print("No records to search.")
         return
 
-    # Labels to display/complete on
     labels = [f"{r['id']}  {r['text']}" if r['text'] else r['id'] for r in records]
     completer = FuzzyCompleter(WordCompleter(labels, ignore_case=True))
     while True:
         try:
             q = prompt("find> ", completer=completer, complete_while_typing=True)
         except (KeyboardInterrupt, EOFError):
-            print()  # newline after Ctrl-C/D
+            print()
             break
         q = q.strip()
         if not q:
@@ -452,6 +509,12 @@ def interactive_find(include_historical: bool):
 # -----------------------------
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="tickler", description="Append-only JSONL tickler file")
+    parser.add_argument("--version", action="version", version=f"%(prog)s {VERSION}")
+    parser.add_argument(
+        "--file",
+        default=None,
+        help="Path to JSONL store. Precedence: --file > TICKLER_FILE env > config (~/.config/tickler/config.txt)"
+    )
     sub = parser.add_subparsers(dest="cmd")
 
     # due (default)
@@ -497,8 +560,12 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 def main(argv=None):
+    global TICKLER_FILE
     parser = build_parser()
     args = parser.parse_args(argv)
+
+    # Resolve data file path once for this process
+    TICKLER_FILE = resolve_store_path(args.file)
 
     # Default: "tickler" -> behave like "tickler due"
     if args.cmd is None:
@@ -552,7 +619,6 @@ def main(argv=None):
         if args.interactive:
             interactive_find(include_hist)
             return
-        # non-interactive requires a query
         if not args.query:
             print("Provide a query, or use -i for interactive mode.", file=sys.stderr)
             sys.exit(2)
